@@ -1,154 +1,221 @@
+#!/usr/bin/env python3
+"""
+Crypto Trading Bot v3.0 - Единая точка входа
+Объединяет все компоненты в единую систему
+"""
 import asyncio
-import os
-from datetime import datetime
+import argparse
 import logging
-from dotenv import load_dotenv
-import pandas as pd
+import signal
+import sys
+import multiprocessing
+from pathlib import Path
+from datetime import datetime
 
-from src.exchange.bybit_client import HumanizedBybitClient
-from src.strategies.simple_momentum import SimpleMomentumStrategy
-from src.core.database import SessionLocal
-from src.core.models import Trade, Signal
+# Добавляем корневую директорию в путь
+sys.path.append(str(Path(__file__).parent))
+
+from src.core.config import config
+from src.bot.manager import bot_manager
+from src.web.websocket import ws_manager
 
 # Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/trading.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-load_dotenv()
-
-class CryptoTradingBot:
-    def __init__(self):
-        self.client = HumanizedBybitClient()
-        self.strategy = SimpleMomentumStrategy()
-        self.symbol = os.getenv('TRADING_SYMBOL', 'BTCUSDT')
-        self.position_size_percent = float(os.getenv('MAX_POSITION_SIZE_PERCENT', 5))
-        self.is_running = True
-        self.current_position = None
-        
-    async def fetch_klines(self, limit=100):
-        """Получить исторические данные"""
-        try:
-            ohlcv = self.client.exchange.fetch_ohlcv(
-                self.symbol, 
-                timeframe='5m', 
-                limit=limit
-            )
-            df = pd.DataFrame(
-                ohlcv, 
-                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-            )
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df
-        except Exception as e:
-            logger.error(f"Ошибка получения данных: {e}")
-            return None
+def setup_logging(log_level='INFO'):
+    """Настройка системы логирования"""
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     
-    async def check_signals(self):
-        """Проверка торговых сигналов"""
-        df = await self.fetch_klines()
-        if df is None or df.empty:
+    # Создаем директорию для логов
+    Path('logs').mkdir(exist_ok=True)
+    
+    # Настраиваем корневой логгер
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format=log_format,
+        handlers=[
+            logging.FileHandler('logs/trading.log', encoding='utf-8'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    # Отключаем лишние логи от библиотек
+    logging.getLogger('ccxt').setLevel(logging.WARNING)
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('telegram').setLevel(logging.WARNING)
+    
+    return logging.getLogger(__name__)
+
+# Глобальная переменная для сигналов
+shutdown_event = asyncio.Event()
+
+def signal_handler(signum, frame):
+    """Обработчик сигналов для graceful shutdown"""
+    logger = logging.getLogger(__name__)
+    logger.info(f"📡 Получен сигнал {signum}, инициируем graceful shutdown...")
+    shutdown_event.set()
+
+async def run_bot():
+    """Запуск торгового бота"""
+    logger = logging.getLogger(__name__)
+    
+    logger.info("==================================================")
+    logger.info("🤖 Crypto Trading Bot v3.0")
+    logger.info("==================================================")
+    logger.info("🚀 Запуск торгового бота...")
+    
+    try:
+        # Запускаем бота
+        success, message = await bot_manager.start()
+        if not success:
+            logger.error(f"❌ Не удалось запустить бота: {message}")
             return
         
-        # Анализ стратегии
-        analysis = self.strategy.analyze(df)
+        # Ждем сигнала остановки
+        logger.info("✅ Бот запущен. Нажмите Ctrl+C для остановки")
+        await shutdown_event.wait()
         
-        # Логирование анализа
-        logger.info(f"Анализ: {analysis}")
+        logger.info("🛑 Получен сигнал остановки, инициируем shutdown...")
         
-        # Если есть сигнал с достаточной уверенностью
-        if analysis['confidence'] > 0.65:
-            await self.execute_signal(analysis)
-    
-    async def execute_signal(self, analysis):
-        """Исполнение торгового сигнала"""
-        # Получаем баланс
-        balance = await self.client.fetch_balance()
-        free_balance = balance.get('USDT', {}).get('free', 0)
-        
-        if free_balance <= 0:
-            logger.warning("Недостаточно средств")
-            return
-        
-        # Получаем текущую цену
-        ticker = await self.client.fetch_ticker(self.symbol)
-        current_price = ticker['last']
-        
-        # Расчет размера позиции
-        position_value = free_balance * (self.position_size_percent / 100)
-        amount = position_value / current_price
-        
-        # Исполнение ордера
-        if analysis['signal'] == 'BUY' and self.current_position is None:
-            order = await self.client.create_order(
-                self.symbol,
-                'buy',
-                amount
-            )
-            
-            if order:
-                # Сохраняем в БД
-                db = SessionLocal()
-                trade = Trade(
-                    symbol=self.symbol,
-                    side='BUY',
-                    entry_price=current_price,
-                    quantity=amount,
-                    status='OPEN',
-                    strategy='momentum'
-                )
-                db.add(trade)
-                db.commit()
-                db.close()
-                
-                self.current_position = trade
-                logger.info(f"Позиция открыта: BUY {amount} @ {current_price}")
-        
-        elif analysis['signal'] == 'SELL' and self.current_position:
-            order = await self.client.create_order(
-                self.symbol,
-                'sell',
-                self.current_position.quantity
-            )
-            
-            if order:
-                # Обновляем в БД
-                db = SessionLocal()
-                trade = db.query(Trade).filter(Trade.id == self.current_position.id).first()
-                trade.exit_price = current_price
-                trade.profit = (current_price - trade.entry_price) * trade.quantity
-                trade.status = 'CLOSED'
-                trade.closed_at = datetime.utcnow()
-                db.commit()
-                db.close()
-                
-                logger.info(f"Позиция закрыта: SELL @ {current_price}, Profit: {trade.profit}")
-                self.current_position = None
-    
-    async def run(self):
-        """Основной цикл бота"""
-        logger.info(f"Бот запущен. Торговая пара: {self.symbol}")
-        
-        while self.is_running:
-            try:
-                await self.check_signals()
-                
-                # Пауза между проверками (имитация человека)
-                await asyncio.sleep(60)  # Проверка раз в минуту
-                
-            except Exception as e:
-                logger.error(f"Ошибка в основном цикле: {e}")
-                await asyncio.sleep(30)
+    except Exception as e:
+        logger.error(f"💥 Критическая ошибка: {e}", exc_info=True)
+    finally:
+        # Останавливаем бота
+        logger.info("🛑 Остановка бота...")
+        await bot_manager.stop()
+        logger.info("✅ Бот остановлен корректно")
 
-async def main():
-    bot = CryptoTradingBot()
-    await bot.run()
+def run_web():
+    """Запуск веб-интерфейса"""
+    logger = logging.getLogger(__name__)
+    
+    logger.info("==================================================")
+    logger.info("🌐 Crypto Trading Bot Web Interface")
+    logger.info("==================================================")
+    logger.info(f"🌐 Запуск веб-интерфейса на {config.WEB_HOST}:{config.WEB_PORT}...")
+    
+    import uvicorn
+    from src.web.app import app
+    
+    # Запускаем фоновую задачу для WebSocket broadcast
+    asyncio.create_task(ws_manager.start_broadcast_loop())
+    
+    uvicorn.run(
+        app,
+        host=config.WEB_HOST,
+        port=config.WEB_PORT,
+        log_level="info"
+    )
+
+async def run_all():
+    """Запуск всей системы"""
+    logger = logging.getLogger(__name__)
+    
+    logger.info("==================================================")
+    logger.info("🚀 Crypto Trading Bot v3.0 - Full System")
+    logger.info("==================================================")
+    
+    # Запускаем веб в отдельном процессе
+    web_process = multiprocessing.Process(target=run_web)
+    web_process.start()
+    
+    # Небольшая задержка чтобы веб успел запуститься
+    await asyncio.sleep(2)
+    
+    try:
+        # Запускаем бота в основном процессе
+        await run_bot()
+    finally:
+        # Останавливаем веб-процесс
+        logger.info("🛑 Остановка веб-интерфейса...")
+        web_process.terminate()
+        web_process.join(timeout=5)
+        if web_process.is_alive():
+            web_process.kill()
+        logger.info("✅ Веб-интерфейс остановлен")
+        
+    logger.info("👋 Завершение программы")
+
+def main():
+    """Главная функция"""
+    parser = argparse.ArgumentParser(
+        description='Crypto Trading Bot v3.0',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Примеры использования:
+  python main.py              # Запуск всей системы (бот + веб)
+  python main.py --bot        # Только торговый бот
+  python main.py --web        # Только веб-интерфейс
+  python main.py --check      # Проверка системы
+        """
+    )
+    
+    parser.add_argument(
+        '--bot', 
+        action='store_true',
+        help='Запустить только торгового бота'
+    )
+    parser.add_argument(
+        '--web', 
+        action='store_true',
+        help='Запустить только веб-интерфейс'
+    )
+    parser.add_argument(
+        '--check', 
+        action='store_true',
+        help='Проверить настройки системы'
+    )
+    parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        default='INFO',
+        help='Уровень логирования'
+    )
+    
+    args = parser.parse_args()
+    
+    # Настраиваем логирование
+    logger = setup_logging(args.log_level)
+    
+    # Создаем необходимые директории
+    for directory in ['logs', 'data/cache', 'data/backups']:
+        Path(directory).mkdir(parents=True, exist_ok=True)
+    
+    # Проверка системы
+    if args.check:
+        from scripts.check_system import run_system_check
+        sys.exit(run_system_check())
+    
+    # Проверяем конфигурацию
+    if not config.BYBIT_API_KEY or config.BYBIT_API_KEY == 'your_testnet_api_key_here':
+        logger.error("❌ API ключи не настроены!")
+        logger.info("📝 Настройте их в /etc/crypto/config/.env")
+        sys.exit(1)
+    
+    # Устанавливаем обработчики сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Определяем режим запуска
+    if args.bot and args.web:
+        logger.error("❌ Нельзя использовать --bot и --web одновременно")
+        sys.exit(1)
+    
+    try:
+        if args.bot:
+            # Только бот
+            asyncio.run(run_bot())
+        elif args.web:
+            # Только веб
+            run_web()
+        else:
+            # Вся система
+            asyncio.run(run_all())
+    except KeyboardInterrupt:
+        logger.info("⌨️ Получен KeyboardInterrupt")
+    except Exception as e:
+        logger.error(f"💥 Неожиданная ошибка: {e}", exc_info=True)
+        sys.exit(1)
+    finally:
+        logger.info("🏁 Программа завершена")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
