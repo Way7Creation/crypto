@@ -17,17 +17,13 @@ sys.path.append(str(Path(__file__).parent))
 
 from src.core.config import config
 from src.bot.manager import bot_manager
-from src.web.websocket import ws_manager
 
-# Настройка логирования
 def setup_logging(log_level='INFO'):
     """Настройка системы логирования"""
     log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     
-    # Создаем директорию для логов
     Path('logs').mkdir(exist_ok=True)
     
-    # Настраиваем корневой логгер
     logging.basicConfig(
         level=getattr(logging, log_level),
         format=log_format,
@@ -37,10 +33,9 @@ def setup_logging(log_level='INFO'):
         ]
     )
     
-    # Отключаем лишние логи от библиотек
-    logging.getLogger('ccxt').setLevel(logging.WARNING)
-    logging.getLogger('urllib3').setLevel(logging.WARNING)
-    logging.getLogger('telegram').setLevel(logging.WARNING)
+    # Уменьшаем многословность внешних библиотек
+    for logger_name in ['ccxt', 'urllib3', 'telegram', 'uvicorn.access']:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
     
     return logging.getLogger(__name__)
 
@@ -63,13 +58,11 @@ async def run_bot():
     logger.info("🚀 Запуск торгового бота...")
     
     try:
-        # Запускаем бота
         success, message = await bot_manager.start()
         if not success:
             logger.error(f"❌ Не удалось запустить бота: {message}")
             return
         
-        # Ждем сигнала остановки
         logger.info("✅ Бот запущен. Нажмите Ctrl+C для остановки")
         await shutdown_event.wait()
         
@@ -78,13 +71,46 @@ async def run_bot():
     except Exception as e:
         logger.error(f"💥 Критическая ошибка: {e}", exc_info=True)
     finally:
-        # Останавливаем бота
         logger.info("🛑 Остановка бота...")
         await bot_manager.stop()
         logger.info("✅ Бот остановлен корректно")
 
+async def run_web_async():
+    """Асинхронный запуск веб-интерфейса"""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        import uvicorn
+        from src.web.app import app
+        from src.web.websocket import ws_manager
+        
+        # Создаем WebSocket broadcast в уже запущенном event loop
+        broadcast_task = asyncio.create_task(ws_manager.start_broadcast_loop())
+        
+        # Настройка uvicorn config
+        uvicorn_config = uvicorn.Config(
+            app,
+            host=config.WEB_HOST,
+            port=config.WEB_PORT,
+            log_level="info",
+            access_log=False
+        )
+        
+        server = uvicorn.Server(uvicorn_config)
+        await server.serve()
+        
+    except Exception as e:
+        logger.error(f"💥 Ошибка веб-сервера: {e}", exc_info=True)
+    finally:
+        if 'broadcast_task' in locals():
+            broadcast_task.cancel()
+            try:
+                await broadcast_task
+            except asyncio.CancelledError:
+                pass
+
 def run_web():
-    """Запуск веб-интерфейса"""
+    """Обёртка для запуска веб-интерфейса в отдельном процессе"""
     logger = logging.getLogger(__name__)
     
     logger.info("==================================================")
@@ -92,18 +118,7 @@ def run_web():
     logger.info("==================================================")
     logger.info(f"🌐 Запуск веб-интерфейса на {config.WEB_HOST}:{config.WEB_PORT}...")
     
-    import uvicorn
-    from src.web.app import app
-    
-    # Запускаем фоновую задачу для WebSocket broadcast
-    asyncio.create_task(ws_manager.start_broadcast_loop())
-    
-    uvicorn.run(
-        app,
-        host=config.WEB_HOST,
-        port=config.WEB_PORT,
-        log_level="info"
-    )
+    asyncio.run(run_web_async())
 
 async def run_all():
     """Запуск всей системы"""
@@ -121,10 +136,8 @@ async def run_all():
     await asyncio.sleep(2)
     
     try:
-        # Запускаем бота в основном процессе
         await run_bot()
     finally:
-        # Останавливаем веб-процесс
         logger.info("🛑 Остановка веб-интерфейса...")
         web_process.terminate()
         web_process.join(timeout=5)
@@ -148,31 +161,13 @@ def main():
         """
     )
     
-    parser.add_argument(
-        '--bot', 
-        action='store_true',
-        help='Запустить только торгового бота'
-    )
-    parser.add_argument(
-        '--web', 
-        action='store_true',
-        help='Запустить только веб-интерфейс'
-    )
-    parser.add_argument(
-        '--check', 
-        action='store_true',
-        help='Проверить настройки системы'
-    )
-    parser.add_argument(
-        '--log-level',
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-        default='INFO',
-        help='Уровень логирования'
-    )
+    parser.add_argument('--bot', action='store_true', help='Запустить только торгового бота')
+    parser.add_argument('--web', action='store_true', help='Запустить только веб-интерфейс')
+    parser.add_argument('--check', action='store_true', help='Проверить настройки системы')
+    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO', help='Уровень логирования')
     
     args = parser.parse_args()
     
-    # Настраиваем логирование
     logger = setup_logging(args.log_level)
     
     # Создаем необходимые директории
@@ -181,33 +176,40 @@ def main():
     
     # Проверка системы
     if args.check:
-        from scripts.check_system import run_system_check
-        sys.exit(run_system_check())
+        try:
+            from scripts.check_system import run_system_check
+            sys.exit(run_system_check())
+        except ImportError:
+            logger.warning("⚠️ Модуль проверки системы не найден")
+            sys.exit(1)
     
-    # Проверяем конфигурацию
+    # Проверка API ключей
     if not config.BYBIT_API_KEY or config.BYBIT_API_KEY == 'your_testnet_api_key_here':
         logger.error("❌ API ключи не настроены!")
-        logger.info("📝 Настройте их в /etc/crypto/config/.env")
+        logger.info("📝 Настройте их в .env файле")
         sys.exit(1)
     
-    # Устанавливаем обработчики сигналов
+    # ✅ ИСПРАВЛЕНО: Используем правильное имя атрибута
+    if not config.BYBIT_API_SECRET or config.BYBIT_API_SECRET == 'your_testnet_secret_here':
+        logger.error("❌ Secret ключ не настроен!")
+        logger.info("📝 Настройте BYBIT_API_SECRET в .env файле")
+        sys.exit(1)
+    
+    # Настройка обработчиков сигналов
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Определяем режим запуска
+    # Проверка конфликтующих аргументов
     if args.bot and args.web:
         logger.error("❌ Нельзя использовать --bot и --web одновременно")
         sys.exit(1)
     
     try:
         if args.bot:
-            # Только бот
             asyncio.run(run_bot())
         elif args.web:
-            # Только веб
             run_web()
         else:
-            # Вся система
             asyncio.run(run_all())
     except KeyboardInterrupt:
         logger.info("⌨️ Получен KeyboardInterrupt")

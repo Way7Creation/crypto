@@ -1,19 +1,26 @@
-import os
+"""
+Подключение к базе данных
+Путь: /var/www/www-root/data/www/systemetech.ru/src/core/database.py
+"""
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from dotenv import load_dotenv
+from .config import config
 
-load_dotenv()
+# Создаем engine с pool_pre_ping для автоматического переподключения
+engine = create_engine(
+    config.DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
+    pool_recycle=3600
+)
 
-# Подключение к MySQL
-DATABASE_URL = f"mysql+pymysql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}/{os.getenv('DB_NAME')}"
-
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 def get_db():
+    """Генератор сессии БД для FastAPI"""
     db = SessionLocal()
     try:
         yield db
