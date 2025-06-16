@@ -1,0 +1,362 @@
+"""
+Модели базы данных для Crypto Trading Bot
+Путь: src/core/models.py
+
+ВАЖНО: Этот файл содержит ТОЛЬКО модели SQLAlchemy без импортов других модулей проекта
+для избежания циклических зависимостей
+"""
+from datetime import datetime
+from enum import Enum
+from sqlalchemy import (
+    Column, Integer, String, Float, Boolean, DateTime, Text, JSON, 
+    ForeignKey, Enum as SQLEnum, Index, UniqueConstraint
+)
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+
+# Создаем базовый класс для всех моделей
+Base = declarative_base()
+
+# ===== ENUMS =====
+class TradeStatus(str, Enum):
+    """Статусы сделок"""
+    PENDING = "PENDING"
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    CANCELLED = "CANCELLED"
+    ERROR = "ERROR"
+
+class OrderSide(str, Enum):
+    """Направление сделки"""
+    BUY = "BUY"
+    SELL = "SELL"
+
+class OrderType(str, Enum):
+    """Тип ордера"""
+    MARKET = "MARKET"
+    LIMIT = "LIMIT"
+    STOP_LOSS = "STOP_LOSS"
+    TAKE_PROFIT = "TAKE_PROFIT"
+
+class SignalAction(str, Enum):
+    """Действие сигнала"""
+    BUY = "BUY"
+    SELL = "SELL"
+    HOLD = "HOLD"
+
+# ===== МОДЕЛИ =====
+
+class BotState(Base):
+    """Состояние бота"""
+    __tablename__ = 'bot_state'
+    
+    id = Column(Integer, primary_key=True)
+    is_running = Column(Boolean, default=False)
+    start_time = Column(DateTime)
+    stop_time = Column(DateTime)
+    total_trades = Column(Integer, default=0)
+    profitable_trades = Column(Integer, default=0)
+    total_profit = Column(Float, default=0.0)
+    current_balance = Column(Float, default=0.0)
+    updated_at = Column(DateTime, default=func.current_timestamp(), onupdate=func.current_timestamp())
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'is_running': self.is_running,
+            'start_time': self.start_time.isoformat() if self.start_time else None,
+            'stop_time': self.stop_time.isoformat() if self.stop_time else None,
+            'total_trades': self.total_trades,
+            'profitable_trades': self.profitable_trades,
+            'total_profit': self.total_profit,
+            'current_balance': self.current_balance,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+class User(Base):
+    """Модель пользователя"""
+    __tablename__ = 'users'
+    
+    id = Column(Integer, primary_key=True)
+    username = Column(String(50), nullable=False, unique=True)
+    hashed_password = Column(String(128), nullable=False)
+    is_active = Column(Boolean, default=True)
+    is_blocked = Column(Boolean, default=False)
+    failed_login_attempts = Column(Integer, default=0)
+    created_at = Column(DateTime, default=func.current_timestamp())
+    last_login = Column(DateTime)
+    blocked_at = Column(DateTime)
+    email = Column(String(100))
+    is_admin = Column(Boolean, default=False)
+    
+    # Relationships
+    trades = relationship("Trade", back_populates="user")
+    
+    __table_args__ = (
+        Index('idx_username', 'username'),
+    )
+
+class Trade(Base):
+    """Модель сделки"""
+    __tablename__ = 'trades'
+    
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(20), nullable=False)
+    side = Column(String(10), nullable=False)
+    entry_price = Column(Float, nullable=False)
+    exit_price = Column(Float)
+    quantity = Column(Float, nullable=False)
+    profit = Column(Float)
+    status = Column(String(20), nullable=False, default=TradeStatus.OPEN.value)
+    strategy = Column(String(50), nullable=False)
+    created_at = Column(DateTime, default=func.current_timestamp())
+    closed_at = Column(DateTime)
+    stop_loss = Column(Float)
+    take_profit = Column(Float)
+    profit_percent = Column(Float)
+    trailing_stop = Column(Boolean, default=False)
+    commission = Column(Float, default=0.0)
+    notes = Column(Text)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    
+    # Relationships
+    user = relationship("User", back_populates="trades")
+    
+    __table_args__ = (
+        Index('idx_symbol', 'symbol'),
+        Index('idx_status', 'status'),
+        Index('idx_created_at', 'created_at'),
+        Index('idx_closed_at', 'closed_at'),
+    )
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'symbol': self.symbol,
+            'side': self.side,
+            'entry_price': self.entry_price,
+            'exit_price': self.exit_price,
+            'quantity': self.quantity,
+            'profit': self.profit,
+            'status': self.status,
+            'strategy': self.strategy,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'closed_at': self.closed_at.isoformat() if self.closed_at else None,
+            'stop_loss': self.stop_loss,
+            'take_profit': self.take_profit,
+            'profit_percent': self.profit_percent
+        }
+
+class Signal(Base):
+    """Торговые сигналы"""
+    __tablename__ = 'signals'
+    
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(20), nullable=False)
+    action = Column(String(10), nullable=False)
+    confidence = Column(Float, nullable=False)
+    price = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=func.current_timestamp())
+    executed = Column(Boolean, default=False)
+    stop_loss = Column(Float)
+    take_profit = Column(Float)
+    strategy = Column(String(50))
+    reason = Column(Text)
+    executed_at = Column(DateTime)
+    trade_id = Column(Integer)
+    
+    __table_args__ = (
+        Index('idx_symbol', 'symbol'),
+        Index('idx_created_at', 'created_at'),
+        Index('idx_executed', 'executed'),
+        Index('idx_strategy', 'strategy'),
+    )
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'symbol': self.symbol,
+            'action': self.action,
+            'confidence': self.confidence,
+            'price': self.price,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'executed': self.executed,
+            'strategy': self.strategy,
+            'reason': self.reason
+        }
+
+class Balance(Base):
+    """Балансы"""
+    __tablename__ = 'balances'
+    
+    id = Column(Integer, primary_key=True)
+    currency = Column(String(10), nullable=False)
+    total = Column(Float, nullable=False)
+    free = Column(Float, nullable=False)
+    used = Column(Float, nullable=False)
+    timestamp = Column(DateTime, default=func.current_timestamp())
+    
+    __table_args__ = (
+        Index('idx_currency', 'currency'),
+        Index('idx_timestamp', 'timestamp'),
+        Index('idx_currency_timestamp', 'currency', 'timestamp'),
+    )
+
+class TradingPair(Base):
+    """Торговые пары"""
+    __tablename__ = 'trading_pairs'
+    
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(20), nullable=False, unique=True)
+    is_active = Column(Boolean, default=True)
+    min_position_size = Column(Float)
+    max_position_size = Column(Float)
+    strategy = Column(String(50))
+    created_at = Column(DateTime, default=func.current_timestamp())
+    stop_loss_percent = Column(Float, default=2.0)
+    take_profit_percent = Column(Float, default=4.0)
+    updated_at = Column(DateTime, default=func.current_timestamp(), onupdate=func.current_timestamp())
+    
+    __table_args__ = (
+        Index('idx_symbol', 'symbol'),
+    )
+
+class MarketCondition(Base):
+    """Состояние рынка"""
+    __tablename__ = 'market_conditions'
+    
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(20), nullable=False)
+    timeframe = Column(String(20), nullable=False)
+    condition_type = Column(String(50), nullable=False)
+    condition_value = Column(String(50), nullable=False)
+    strength = Column(Float)
+    indicators = Column(JSON)
+    timestamp = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=func.current_timestamp())
+    
+    __table_args__ = (
+        Index('idx_symbol_timestamp', 'symbol', 'timestamp'),
+        Index('idx_condition_type', 'condition_type'),
+    )
+
+class MLModel(Base):
+    """ML модели"""
+    __tablename__ = 'ml_models'
+    
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    model_type = Column(String(50), nullable=False)
+    version = Column(String(50), nullable=False)
+    accuracy = Column(Float)
+    precision_score = Column(Float)
+    recall_score = Column(Float)
+    f1_score = Column(Float)
+    created_at = Column(DateTime, default=func.current_timestamp())
+    updated_at = Column(DateTime, default=func.current_timestamp(), onupdate=func.current_timestamp())
+    parameters = Column(JSON)
+    feature_importance = Column(JSON)
+    training_history = Column(JSON)
+    is_active = Column(Boolean, default=True)
+    
+    __table_args__ = (
+        Index('idx_name_version', 'name', 'version'),
+        Index('idx_model_type', 'model_type'),
+        Index('idx_is_active', 'is_active'),
+    )
+
+class MLPrediction(Base):
+    """ML предсказания"""
+    __tablename__ = 'ml_predictions'
+    
+    id = Column(Integer, primary_key=True)
+    model_id = Column(Integer, ForeignKey('ml_models.id'), nullable=False)
+    symbol = Column(String(20), nullable=False)
+    prediction_type = Column(String(50), nullable=False)
+    prediction_value = Column(JSON, nullable=False)
+    confidence = Column(Float, nullable=False)
+    features_snapshot = Column(JSON)
+    actual_outcome = Column(JSON)
+    created_at = Column(DateTime, default=func.current_timestamp())
+    
+    __table_args__ = (
+        Index('idx_model_symbol', 'model_id', 'symbol'),
+        Index('idx_created_at', 'created_at'),
+    )
+
+class TradingLog(Base):
+    """Логи торговли"""
+    __tablename__ = 'trading_logs'
+    
+    id = Column(Integer, primary_key=True)
+    log_level = Column(String(20), nullable=False)
+    category = Column(String(50), nullable=False)
+    message = Column(Text, nullable=False)
+    context = Column(JSON)
+    symbol = Column(String(20))
+    strategy = Column(String(50))
+    trade_id = Column(Integer)
+    signal_id = Column(Integer)
+    created_at = Column(DateTime, default=func.current_timestamp())
+    
+    __table_args__ = (
+        Index('idx_level_category', 'log_level', 'category'),
+        Index('idx_created_at', 'created_at'),
+        Index('idx_symbol', 'symbol'),
+        Index('idx_trade_id', 'trade_id'),
+    )
+
+# Дополнительные модели для полноты
+
+class Order(Base):
+    """Ордера на бирже"""
+    __tablename__ = 'orders'
+    
+    id = Column(Integer, primary_key=True)
+    exchange_order_id = Column(String(100), unique=True)
+    symbol = Column(String(20), nullable=False)
+    side = Column(String(10), nullable=False)
+    order_type = Column(String(20), nullable=False)
+    price = Column(Float)
+    quantity = Column(Float, nullable=False)
+    filled_quantity = Column(Float, default=0)
+    status = Column(String(20), nullable=False)
+    created_at = Column(DateTime, default=func.current_timestamp())
+    updated_at = Column(DateTime, default=func.current_timestamp(), onupdate=func.current_timestamp())
+    trade_id = Column(Integer, ForeignKey('trades.id'))
+
+class BotSettings(Base):
+    """Настройки бота"""
+    __tablename__ = 'bot_settings'
+    
+    id = Column(Integer, primary_key=True)
+    key = Column(String(50), nullable=False, unique=True)
+    value = Column(Text)
+    updated_at = Column(DateTime, default=func.current_timestamp(), onupdate=func.current_timestamp())
+    description = Column(Text)
+    
+    __table_args__ = (
+        Index('idx_key', 'key'),
+    )
+
+# Экспорт всех моделей
+__all__ = [
+    'Base',
+    'BotState',
+    'User',
+    'Trade',
+    'Signal',
+    'Balance',
+    'TradingPair',
+    'MarketCondition',
+    'MLModel',
+    'MLPrediction',
+    'TradingLog',
+    'Order',
+    'BotSettings',
+    'TradeStatus',
+    'OrderSide',
+    'OrderType',
+    'SignalAction'
+]
