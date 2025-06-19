@@ -280,6 +280,82 @@ class ExchangeClient(HumanBehaviorMixin):
         except Exception as e:
             logger.error(f"❌ Ошибка расчета размера позиции: {e}")
             return 0.001  # Минимальный размер по умолчанию
+            
+    
 
 # Глобальный экземпляр клиента
 exchange_client = ExchangeClient()
+
+
+def get_exchange_client() -> ExchangeClient:
+    """
+    Получить глобальный экземпляр Exchange клиента
+    
+    Эта функция нужна для обратной совместимости с existing кодом,
+    который ожидает функцию get_exchange_client()
+    
+    Returns:
+        ExchangeClient: Готовый к использованию экземпляр клиента
+    """
+    global exchange_client
+    
+    if exchange_client is None:
+        exchange_client = ExchangeClient()
+    
+    return exchange_client
+
+def create_exchange_client() -> ExchangeClient:
+    """
+    Создать новый экземпляр Exchange клиента
+    
+    Returns:
+        ExchangeClient: Новый экземпляр клиента
+    """
+    return ExchangeClient()
+
+def test_connection() -> bool:
+    """
+    Быстрая проверка подключения к бирже
+    
+    Returns:
+        bool: True если подключение работает
+    """
+    try:
+        client = get_exchange_client()
+        # Синхронная проверка для быстрой валидации
+        client.exchange.fetch_time()
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка тестирования подключения: {e}")
+        return False
+
+# Дополнительные функции для удобства
+def get_balance_sync() -> dict:
+    """Синхронное получение баланса"""
+    try:
+        client = get_exchange_client()
+        return client.exchange.fetch_balance()
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения баланса: {e}")
+        return {}
+
+def get_price_sync(symbol: str) -> float:
+    """Синхронное получение цены"""
+    try:
+        client = get_exchange_client()
+        ticker = client.exchange.fetch_ticker(symbol)
+        return ticker['last']
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения цены {symbol}: {e}")
+        return 0.0
+
+# Экспорты для __init__.py
+__all__ = [
+    'ExchangeClient',
+    'exchange_client', 
+    'get_exchange_client',
+    'create_exchange_client',
+    'test_connection',
+    'get_balance_sync',
+    'get_price_sync'
+]

@@ -172,6 +172,7 @@ class BotManager:
             logger.info("✅ Exchange клиент подключен")
         except Exception as e:
             logger.warning(f"⚠️ Не удалось инициализировать Exchange: {e}")
+            self.exchange = None  # ✅ ДОБАВИТЬ ЭТУ СТРОКУ!
         
         try:
             # Анализатор рынка
