@@ -1,28 +1,91 @@
 """
-Trainer для обучения и оценки ML моделей
+Улучшенный Trainer для обучения и оценки ML моделей
 Файл: src/ml/training/trainer.py
+
+Объединяет полную функциональность с практической реализацией
 """
 import asyncio
 import numpy as np
 import pandas as pd
+import pickle
 from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime, timedelta
 from sklearn.model_selection import train_test_split, TimeSeriesSplit
-from sklearn.metrics import classification_report
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    classification_report, confusion_matrix
+)
+from sklearn.ensemble import RandomForestClassifier
 import json
 from pathlib import Path
 
 from sqlalchemy.orm import Session
 from ...core.database import SessionLocal
 from ...core.models import Trade, Signal
+from ...core.config import Config
 from ...logging.smart_logger import SmartLogger
 from ..features.feature_engineering import FeatureEngineer
 from ..models.classifier import DirectionClassifier
 
 
+class EnsembleModel:
+    """
+    Ансамбль ML моделей с взвешенным голосованием
+    """
+    
+    def __init__(self, models: Dict, weights: Optional[List[float]] = None, name: str = "ensemble"):
+        self.models = models
+        self.weights = weights or [1/len(models)] * len(models)
+        self.name = name
+        self.feature_columns = None
+        
+        # Нормализуем веса
+        total_weight = sum(self.weights)
+        self.weights = [w / total_weight for w in self.weights]
+    
+    def predict_proba(self, X):
+        """Предсказание вероятностей с взвешенным усреднением"""
+        predictions = []
+        model_names = list(self.models.keys())
+        
+        for i, (name, model) in enumerate(self.models.items()):
+            try:
+                if hasattr(model, 'predict_proba'):
+                    pred = model.predict_proba(X)
+                else:
+                    # Для моделей без predict_proba создаем one-hot
+                    pred_classes = model.predict(X)
+                    unique_classes = np.unique(pred_classes)
+                    pred = np.zeros((len(pred_classes), len(unique_classes)))
+                    for j, cls in enumerate(unique_classes):
+                        pred[pred_classes == cls, j] = 1.0
+                
+                predictions.append(pred * self.weights[i])
+            except Exception as e:
+                # Если модель сломана, пропускаем её
+                continue
+        
+        if not predictions:
+            raise ValueError("Все модели в ансамбле недоступны")
+        
+        # Суммируем взвешенные предсказания
+        ensemble_pred = np.sum(predictions, axis=0)
+        return ensemble_pred
+    
+    def predict(self, X):
+        """Предсказание классов"""
+        proba = self.predict_proba(X)
+        return np.argmax(proba, axis=1) - 1  # Возвращаем -1, 0, 1
+    
+    def get_confidence(self, X):
+        """Получение уверенности предсказания"""
+        proba = self.predict_proba(X)
+        return np.max(proba, axis=1)
+
+
 class MLTrainer:
     """
-    Координатор обучения ML моделей
+    Улучшенный координатор обучения ML моделей
     """
     
     def __init__(self):
@@ -30,506 +93,556 @@ class MLTrainer:
         self.feature_engineer = FeatureEngineer()
         self.models = {}
         
-        # Директория для отчетов
+        # Директории
         self.reports_dir = Path("reports/ml")
+        self.models_dir = Path("models/trained")
         self.reports_dir.mkdir(parents=True, exist_ok=True)
+        self.models_dir.mkdir(parents=True, exist_ok=True)
         
-        # Параметры обучения
+        # Конфигурация обучения
         self.training_config = {
-            'min_samples': 1000,  # Минимум образцов для обучения
-            'val_split': 0.2,     # Размер валидационной выборки
-            'test_split': 0.1,    # Размер тестовой выборки
-            'retrain_interval_hours': 24,  # Интервал переобучения
-            'model_types': ['xgboost', 'random_forest'],  # Типы моделей для ансамбля
-            'symbols': [],  # Заполняется из БД
-            'timeframes': ['5m', '15m', '1h']  # Таймфреймы для анализа
+            'min_samples': Config.ML_MIN_TRAINING_DATA or 1000,
+            'val_split': 0.2,
+            'test_split': 0.1,
+            'retrain_interval_hours': Config.RETRAIN_INTERVAL_HOURS or 24,
+            'model_types': ['random_forest', 'xgboost', 'lightgbm'],
+            'symbols': [],
+            'timeframes': ['5m', '15m', '1h'],
+            'target_periods': 5,  # Предсказываем на 5 периодов вперед
+            'lookback_periods': 2000
         }
         
         # История обучения
         self.training_history = []
+        
+        # Конфигурация моделей
+        self.model_configs = {
+            'random_forest': {
+                'class': RandomForestClassifier,
+                'params': {
+                    'n_estimators': 100,
+                    'max_depth': 10,
+                    'min_samples_split': 5,
+                    'min_samples_leaf': 2,
+                    'class_weight': 'balanced',
+                    'n_jobs': -1,
+                    'random_state': 42
+                }
+            },
+            'xgboost': {
+                'params': {
+                    'n_estimators': 100,
+                    'max_depth': 6,
+                    'learning_rate': 0.1,
+                    'subsample': 0.8,
+                    'colsample_bytree': 0.8,
+                    'random_state': 42,
+                    'eval_metric': 'mlogloss'
+                }
+            },
+            'lightgbm': {
+                'params': {
+                    'n_estimators': 100,
+                    'max_depth': 6,
+                    'learning_rate': 0.1,
+                    'subsample': 0.8,
+                    'colsample_bytree': 0.8,
+                    'class_weight': 'balanced',
+                    'random_state': 42,
+                    'verbose': -1
+                }
+            }
+        }
     
     async def initialize(self):
         """Инициализация тренера"""
-        # Загружаем активные символы из БД
         db = SessionLocal()
         try:
-            # Получаем уникальные символы из недавних сделок
-            recent_trades = db.query(Trade.symbol).distinct().all()
-            self.training_config['symbols'] = [t[0] for t in recent_trades]
+            # Загружаем активные символы из конфигурации и БД
+            if Config.TRADING_PAIRS:
+                self.training_config['symbols'] = Config.TRADING_PAIRS
+            else:
+                # Получаем уникальные символы из недавних сделок
+                recent_trades = db.query(Trade.symbol).distinct().limit(50).all()
+                self.training_config['symbols'] = [t[0] for t in recent_trades]
             
             if not self.training_config['symbols']:
-                # Если нет сделок, используем популярные пары
+                # Если нет данных, используем популярные пары
                 self.training_config['symbols'] = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT']
             
             self.logger.info(
                 "ML Trainer инициализирован",
                 category='ml',
-                symbols=self.training_config['symbols'],
+                symbols=self.training_config['symbols'][:5],  # Показываем первые 5
+                total_symbols=len(self.training_config['symbols']),
                 model_types=self.training_config['model_types']
             )
             
         finally:
             db.close()
     
-    async def train_all_models(self):
-        """Обучает все модели для всех символов"""
-        self.logger.info("Начинаем обучение всех моделей", category='ml')
+    async def train_symbol_model(self, symbol: str, timeframe: str = '5m') -> Dict[str, Any]:
+        """
+        РЕАЛЬНОЕ обучение модели для конкретного символа
+        """
+        try:
+            self.logger.info(f"🚀 Начинаем обучение модели для {symbol}", category='ml', symbol=symbol)
+            
+            # === 1. ПОДГОТОВКА ДАННЫХ ===
+            df = await self.feature_engineer.extract_features(
+                symbol=symbol,
+                timeframe=timeframe,
+                lookback_periods=self.training_config['lookback_periods']
+            )
+            
+            if df.empty:
+                return {'success': False, 'error': 'Нет данных для обучения'}
+            
+            X, y = self.feature_engineer.prepare_training_data(
+                df,
+                target_type='direction',
+                target_periods=self.training_config['target_periods']
+            )
+            
+            if len(X) < self.training_config['min_samples']:
+                return {
+                    'success': False,
+                    'error': f'Недостаточно данных: {len(X)} < {self.training_config["min_samples"]}'
+                }
+            
+            # === 2. ВРЕМЕННОЕ РАЗДЕЛЕНИЕ ДАННЫХ ===
+            # Важно для временных рядов!
+            test_size = int(len(X) * self.training_config['test_split'])
+            X_temp, X_test = X[:-test_size], X[-test_size:]
+            y_temp, y_test = y[:-test_size], y[-test_size:]
+            
+            # Валидационная выборка
+            val_size = int(len(X_temp) * self.training_config['val_split'])
+            X_train, X_val = X_temp[:-val_size], X_temp[-val_size:]
+            y_train, y_val = y_temp[:-val_size], y_temp[-val_size:]
+            
+            self.logger.info(
+                f"Данные подготовлены для {symbol}",
+                category='ml',
+                train_size=len(X_train),
+                val_size=len(X_val),
+                test_size=len(X_test),
+                class_distribution=y_train.value_counts().to_dict()
+            )
+            
+            # === 3. ОБУЧЕНИЕ МОДЕЛЕЙ ===
+            trained_models = {}
+            results = {}
+            
+            # Random Forest (всегда доступен)
+            try:
+                rf_config = self.model_configs['random_forest']
+                rf_model = rf_config['class'](**rf_config['params'])
+                rf_model.fit(X_train, y_train)
+                trained_models['random_forest'] = rf_model
+                
+                # Оценка
+                results['random_forest'] = await self._evaluate_model(
+                    rf_model, X_train, y_train, X_val, y_val, X_test, y_test
+                )
+                
+            except Exception as e:
+                self.logger.error(f"Ошибка обучения Random Forest: {e}", category='ml')
+            
+            # XGBoost (опционально)
+            try:
+                import xgboost as xgb
+                xgb_config = self.model_configs['xgboost']
+                xgb_model = xgb.XGBClassifier(**xgb_config['params'])
+                xgb_model.fit(X_train, y_train)
+                trained_models['xgboost'] = xgb_model
+                
+                results['xgboost'] = await self._evaluate_model(
+                    xgb_model, X_train, y_train, X_val, y_val, X_test, y_test
+                )
+                
+            except ImportError:
+                self.logger.warning("XGBoost не установлен, пропускаем", category='ml')
+            except Exception as e:
+                self.logger.error(f"Ошибка обучения XGBoost: {e}", category='ml')
+            
+            # LightGBM (опционально)
+            try:
+                import lightgbm as lgb
+                lgb_config = self.model_configs['lightgbm']
+                lgb_model = lgb.LGBMClassifier(**lgb_config['params'])
+                lgb_model.fit(X_train, y_train)
+                trained_models['lightgbm'] = lgb_model
+                
+                results['lightgbm'] = await self._evaluate_model(
+                    lgb_model, X_train, y_train, X_val, y_val, X_test, y_test
+                )
+                
+            except ImportError:
+                self.logger.warning("LightGBM не установлен, пропускаем", category='ml')
+            except Exception as e:
+                self.logger.error(f"Ошибка обучения LightGBM: {e}", category='ml')
+            
+            if not trained_models:
+                return {'success': False, 'error': 'Не удалось обучить ни одной модели'}
+            
+            # === 4. СОЗДАНИЕ АНСАМБЛЯ ===
+            # Веса основаны на валидационной точности
+            weights = []
+            for model_name in trained_models.keys():
+                weights.append(results[model_name]['val_accuracy'])
+            
+            ensemble = EnsembleModel(
+                models=trained_models,
+                weights=weights,
+                name=f"{symbol}_ensemble"
+            )
+            ensemble.feature_columns = df.columns.tolist()
+            
+            # Оценка ансамбля
+            ensemble_results = await self._evaluate_model(
+                ensemble, X_train, y_train, X_val, y_val, X_test, y_test
+            )
+            results['ensemble'] = ensemble_results
+            
+            # === 5. ВЫБОР ЛУЧШЕЙ МОДЕЛИ ===
+            best_model_name = max(results.keys(), key=lambda k: results[k]['val_accuracy'])
+            best_single_model = trained_models.get(best_model_name, list(trained_models.values())[0])
+            
+            # === 6. СОХРАНЕНИЕ МОДЕЛИ ===
+            model_data = {
+                'ensemble': ensemble,
+                'best_single': best_single_model,
+                'trained_models': trained_models,
+                'feature_columns': df.columns.tolist(),
+                'results': results,
+                'training_config': self.training_config,
+                'training_date': datetime.utcnow().isoformat(),
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'data_info': {
+                    'train_size': len(X_train),
+                    'val_size': len(X_val),
+                    'test_size': len(X_test),
+                    'feature_count': len(df.columns)
+                }
+            }
+            
+            model_path = self.models_dir / f"{symbol}_{timeframe}_model.pkl"
+            with open(model_path, 'wb') as f:
+                pickle.dump(model_data, f)
+            
+            # Сохраняем в память
+            self.models[f"{symbol}_{timeframe}"] = ensemble
+            
+            # === 7. ГЕНЕРАЦИЯ ОТЧЕТОВ ===
+            await self.generate_symbol_report(symbol, timeframe, results, model_data)
+            
+            self.logger.info(
+                f"✅ Модель для {symbol} обучена и сохранена",
+                category='ml',
+                symbol=symbol,
+                best_model=best_model_name,
+                best_accuracy=f"{results[best_model_name]['val_accuracy']:.3f}",
+                ensemble_accuracy=f"{results['ensemble']['val_accuracy']:.3f}"
+            )
+            
+            return {
+                'success': True,
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'best_model': best_model_name,
+                'ensemble_accuracy': results['ensemble']['test_accuracy'],
+                'models_trained': list(trained_models.keys()),
+                'results': {k: {metric: v for metric, v in v.items() if metric not in ['model']} 
+                           for k, v in results.items()},
+                'model_path': str(model_path)
+            }
+            
+        except Exception as e:
+            self.logger.error(
+                f"❌ Ошибка обучения модели для {symbol}: {e}",
+                category='ml',
+                symbol=symbol,
+                error=str(e)
+            )
+            return {'success': False, 'error': str(e)}
+    
+    async def _evaluate_model(self, model, X_train, y_train, X_val, y_val, X_test, y_test):
+        """Оценка модели на всех выборках"""
+        try:
+            # Предсказания
+            train_pred = model.predict(X_train)
+            val_pred = model.predict(X_val)
+            test_pred = model.predict(X_test)
+            
+            # Метрики
+            return {
+                'train_accuracy': accuracy_score(y_train, train_pred),
+                'val_accuracy': accuracy_score(y_val, val_pred),
+                'test_accuracy': accuracy_score(y_test, test_pred),
+                'test_precision': precision_score(y_test, test_pred, average='weighted', zero_division=0),
+                'test_recall': recall_score(y_test, test_pred, average='weighted', zero_division=0),
+                'test_f1': f1_score(y_test, test_pred, average='weighted', zero_division=0),
+                'model': model
+            }
+        except Exception as e:
+            self.logger.error(f"Ошибка оценки модели: {e}", category='ml')
+            return {
+                'train_accuracy': 0, 'val_accuracy': 0, 'test_accuracy': 0,
+                'test_precision': 0, 'test_recall': 0, 'test_f1': 0,
+                'model': model
+            }
+    
+    async def train_all_models(self) -> Dict[str, Any]:
+        """Обучает модели для всех символов"""
+        self.logger.info("🚀 Начинаем массовое обучение моделей", category='ml')
         
-        results = {}
+        all_results = {}
+        successful_models = 0
         
         for symbol in self.training_config['symbols']:
-            self.logger.info(f"Обучение моделей для {symbol}", category='ml', symbol=symbol)
-            
             try:
-                # Готовим данные
-                X_train, X_val, X_test, y_train, y_val, y_test = await self.prepare_data(symbol)
+                result = await self.train_symbol_model(symbol)
+                all_results[symbol] = result
                 
-                if X_train is None or len(X_train) < self.training_config['min_samples']:
-                    self.logger.warning(
-                        f"Недостаточно данных для {symbol}",
-                        category='ml',
-                        symbol=symbol,
-                        samples=len(X_train) if X_train is not None else 0
-                    )
-                    continue
+                if result.get('success'):
+                    successful_models += 1
                 
-                symbol_results = {}
-                
-                # Обучаем разные типы моделей
-                for model_type in self.training_config['model_types']:
-                    model_name = f"{symbol}_{model_type}"
-                    
-                    # Создаем и обучаем модель
-                    model = DirectionClassifier(model_type=model_type, name=model_name)
-                    
-                    # Обучение
-                    metrics = model.train(
-                        X_train, y_train,
-                        X_val, y_val,
-                        optimize_params=True,
-                        select_features=True
-                    )
-                    
-                    # Тестирование
-                    test_metrics = model.evaluate(X_test, y_test)
-                    metrics['test'] = test_metrics
-                    
-                    # Сохраняем модель
-                    self.models[model_name] = model
-                    symbol_results[model_type] = metrics
-                    
-                    # Генерируем отчет
-                    await self.generate_model_report(model, X_test, y_test, symbol, model_type)
-                
-                # Создаем ансамбль
-                ensemble_model = await self.create_ensemble(symbol, X_train, y_train, X_val, y_val)
-                if ensemble_model:
-                    ensemble_metrics = ensemble_model.evaluate(X_test, y_test)
-                    symbol_results['ensemble'] = {'test': ensemble_metrics}
-                    self.models[f"{symbol}_ensemble"] = ensemble_model
-                
-                results[symbol] = symbol_results
+                # Небольшая пауза между обучениями
+                await asyncio.sleep(1)
                 
             except Exception as e:
                 self.logger.error(
-                    f"Ошибка обучения для {symbol}: {e}",
+                    f"Критическая ошибка обучения для {symbol}: {e}",
                     category='ml',
-                    symbol=symbol,
-                    error=str(e)
+                    symbol=symbol
                 )
+                all_results[symbol] = {'success': False, 'error': str(e)}
         
-        # Сохраняем историю обучения
-        self.training_history.append({
-            'timestamp': datetime.utcnow().isoformat(),
-            'results': results
-        })
+        # Общая статистика
+        total_symbols = len(self.training_config['symbols'])
+        success_rate = successful_models / total_symbols if total_symbols > 0 else 0
         
-        # Генерируем общий отчет
-        await self.generate_training_report(results)
-        
-        return results
-    
-    async def prepare_data(self, symbol: str, 
-                          timeframe: str = '5m') -> Tuple[pd.DataFrame, ...]:
-        """
-        Подготавливает данные для обучения
-        
-        Returns:
-            X_train, X_val, X_test, y_train, y_val, y_test
-        """
-        self.logger.info(
-            f"Подготовка данных для {symbol}",
-            category='ml',
-            symbol=symbol,
-            timeframe=timeframe
-        )
-        
-        # Извлекаем признаки
-        df = await self.feature_engineer.extract_features(
-            symbol=symbol,
-            timeframe=timeframe,
-            lookback_periods=2000  # ~1 неделя для 5m
-        )
-        
-        if df.empty:
-            return None, None, None, None, None, None
-        
-        # Подготавливаем обучающие данные
-        X, y = self.feature_engineer.prepare_training_data(
-            df,
-            target_type='direction',
-            target_periods=5  # Предсказываем на 5 свечей вперед
-        )
-        
-        if len(X) < self.training_config['min_samples']:
-            return None, None, None, None, None, None
-        
-        # Временное разделение (важно для временных рядов!)
-        # Сначала отделяем тестовую выборку
-        test_size = int(len(X) * self.training_config['test_split'])
-        X_temp, X_test = X[:-test_size], X[-test_size:]
-        y_temp, y_test = y[:-test_size], y[-test_size:]
-        
-        # Затем валидационную
-        val_size = int(len(X_temp) * self.training_config['val_split'])
-        X_train, X_val = X_temp[:-val_size], X_temp[-val_size:]
-        y_train, y_val = y_temp[:-val_size], y_temp[-val_size:]
-        
-        self.logger.info(
-            f"Данные подготовлены для {symbol}",
-            category='ml',
-            train_size=len(X_train),
-            val_size=len(X_val),
-            test_size=len(X_test),
-            class_distribution=y_train.value_counts().to_dict()
-        )
-        
-        return X_train, X_val, X_test, y_train, y_val, y_test
-    
-    async def create_ensemble(self, symbol: str, X_train: pd.DataFrame, y_train: pd.Series,
-                            X_val: pd.DataFrame, y_val: pd.Series) -> Optional[DirectionClassifier]:
-        """
-        Создает ансамбль моделей
-        """
-        self.logger.info(f"Создаем ансамбль для {symbol}", category='ml', symbol=symbol)
-        
-        # Собираем предсказания от всех моделей
-        predictions = []
-        weights = []
-        
-        for model_type in self.training_config['model_types']:
-            model_name = f"{symbol}_{model_type}"
-            if model_name in self.models:
-                model = self.models[model_name]
-                
-                # Получаем предсказания вероятностей
-                val_proba = model.predict_proba(X_val)
-                predictions.append(val_proba)
-                
-                # Вес основан на F1-score
-                val_metrics = model.evaluate(X_val, y_val)
-                weights.append(val_metrics['f1_score'])
-        
-        if len(predictions) < 2:
-            return None
-        
-        # Нормализуем веса
-        weights = np.array(weights)
-        weights = weights / weights.sum()
-        
-        # Взвешенное усреднение вероятностей
-        ensemble_proba = np.zeros_like(predictions[0])
-        for i, (pred, weight) in enumerate(zip(predictions, weights)):
-            ensemble_proba += pred * weight
-        
-        # Создаем ensemble модель (обертка)
-        class EnsembleModel:
-            def __init__(self, models, weights):
-                self.models = models
-                self.weights = weights
-                self.name = f"{symbol}_ensemble"
-                self.selected_features = models[0].selected_features
-            
-            def predict(self, X):
-                predictions = []
-                for model in self.models:
-                    predictions.append(model.predict_proba(X))
-                
-                ensemble_proba = np.zeros_like(predictions[0])
-                for pred, weight in zip(predictions, self.weights):
-                    ensemble_proba += pred * weight
-                
-                return np.argmax(ensemble_proba, axis=1) - 1  # Возвращаем -1, 0, 1
-            
-            def predict_proba(self, X):
-                predictions = []
-                for model in self.models:
-                    predictions.append(model.predict_proba(X))
-                
-                ensemble_proba = np.zeros_like(predictions[0])
-                for pred, weight in zip(predictions, self.weights):
-                    ensemble_proba += pred * weight
-                
-                return ensemble_proba
-            
-            def evaluate(self, X, y):
-                from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-                
-                predictions = self.predict(X)
-                return {
-                    'accuracy': accuracy_score(y, predictions),
-                    'precision': precision_score(y, predictions, average='macro', zero_division=0),
-                    'recall': recall_score(y, predictions, average='macro', zero_division=0),
-                    'f1_score': f1_score(y, predictions, average='macro', zero_division=0)
-                }
-        
-        # Создаем ансамбль
-        ensemble_models = [self.models[f"{symbol}_{mt}"] for mt in self.training_config['model_types'] 
-                          if f"{symbol}_{mt}" in self.models]
-        
-        ensemble = EnsembleModel(ensemble_models, weights)
-        
-        self.logger.info(
-            f"Ансамбль создан для {symbol}",
-            category='ml',
-            symbol=symbol,
-            model_count=len(ensemble_models),
-            weights=weights.tolist()
-        )
-        
-        return ensemble
-    
-    async def predict_direction(self, symbol: str, features: pd.DataFrame,
-                              use_ensemble: bool = True) -> Dict[str, Any]:
-        """
-        Предсказывает направление движения цены
-        """
-        model_name = f"{symbol}_ensemble" if use_ensemble else f"{symbol}_xgboost"
-        
-        if model_name not in self.models:
-            # Пробуем загрузить модель
-            try:
-                model = DirectionClassifier(name=model_name)
-                model.load_model()
-                self.models[model_name] = model
-            except:
-                self.logger.warning(
-                    f"Модель {model_name} не найдена",
-                    category='ml',
-                    model_name=model_name
-                )
-                return None
-        
-        model = self.models[model_name]
-        
-        # Предсказание
-        prediction = model.predict(features)[-1]  # Последнее предсказание
-        probabilities = model.predict_proba(features)[-1]
-        
-        # Интерпретация
-        direction_map = {-1: 'DOWN', 0: 'SIDEWAYS', 1: 'UP'}
-        
-        result = {
-            'direction': direction_map[prediction],
-            'confidence': float(probabilities.max()),
-            'probabilities': {
-                'DOWN': float(probabilities[0]),
-                'SIDEWAYS': float(probabilities[1]),
-                'UP': float(probabilities[2])
-            },
-            'model': model_name,
-            'timestamp': datetime.utcnow().isoformat()
-        }
-        
-        # Сохраняем предсказание в БД
-        await self._save_prediction(symbol, result, features)
-        
-        return result
-    
-    async def _save_prediction(self, symbol: str, prediction: Dict, features: pd.DataFrame):
-        """Сохраняет предсказание в БД"""
-        from ...core.models import Base
-        from sqlalchemy import Column, Integer, String, Float, DateTime, JSON
-        
-        class MLPrediction(Base):
-            __tablename__ = "ml_predictions"
-            
-            id = Column(Integer, primary_key=True, index=True)
-            model_id = Column(Integer, nullable=False)
-            symbol = Column(String(20), nullable=False)
-            prediction_type = Column(String(50), nullable=False)
-            prediction_value = Column(JSON, nullable=False)
-            confidence = Column(Float, nullable=False)
-            features_snapshot = Column(JSON)
-            actual_outcome = Column(JSON)
-            created_at = Column(DateTime, default=datetime.utcnow)
-        
-        db = SessionLocal()
-        try:
-            # Получаем ID модели
-            model_name = prediction['model']
-            # Здесь нужно получить ID из таблицы ml_models
-            
-            # Сохраняем топ признаки
-            top_features = {}
-            if hasattr(self.models[model_name], 'selected_features'):
-                selected_features = self.models[model_name].selected_features[:10]
-                top_features = features[selected_features].iloc[-1].to_dict()
-            
-            db_prediction = MLPrediction(
-                model_id=1,  # Заглушка, нужно получить реальный ID
-                symbol=symbol,
-                prediction_type='direction',
-                prediction_value=prediction,
-                confidence=prediction['confidence'],
-                features_snapshot=top_features
-            )
-            
-            db.add(db_prediction)
-            db.commit()
-            
-        except Exception as e:
-            db.rollback()
-            self.logger.error(f"Ошибка сохранения предсказания: {e}", category='ml')
-        finally:
-            db.close()
-    
-    async def evaluate_predictions(self, hours_back: int = 24) -> Dict[str, Any]:
-        """Оценивает точность предсказаний за период"""
-        db = SessionLocal()
-        try:
-            # Получаем предсказания за период
-            cutoff_time = datetime.utcnow() - timedelta(hours=hours_back)
-            
-            # Здесь нужно сравнить предсказания с реальными движениями цены
-            # и обновить actual_outcome в БД
-            
-            evaluation_results = {
-                'period_hours': hours_back,
-                'total_predictions': 0,
-                'accuracy_by_symbol': {},
-                'accuracy_by_confidence': {}
-            }
-            
-            return evaluation_results
-            
-        finally:
-            db.close()
-    
-    async def generate_model_report(self, model: DirectionClassifier, 
-                                  X_test: pd.DataFrame, y_test: pd.Series,
-                                  symbol: str, model_type: str):
-        """Генерирует детальный отчет по модели"""
-        predictions = model.predict(X_test)
-        probabilities = model.predict_proba(X_test)
-        
-        # Classification report
-        report = classification_report(
-            y_test, predictions,
-            target_names=['DOWN', 'SIDEWAYS', 'UP'],
-            output_dict=True
-        )
-        
-        # Feature importance
-        feature_importance = model.get_feature_importance()
-        
-        # Confidence analysis
-        max_probs = probabilities.max(axis=1)
-        confidence_analysis = {
-            'mean_confidence': float(max_probs.mean()),
-            'confidence_distribution': {
-                'low (<0.4)': float((max_probs < 0.4).sum() / len(max_probs)),
-                'medium (0.4-0.6)': float(((max_probs >= 0.4) & (max_probs < 0.6)).sum() / len(max_probs)),
-                'high (0.6-0.8)': float(((max_probs >= 0.6) & (max_probs < 0.8)).sum() / len(max_probs)),
-                'very_high (>0.8)': float((max_probs >= 0.8).sum() / len(max_probs))
-            }
-        }
-        
-        # Полный отчет
-        full_report = {
-            'symbol': symbol,
-            'model_type': model_type,
-            'timestamp': datetime.utcnow().isoformat(),
-            'performance_metrics': model.performance_metrics,
-            'classification_report': report,
-            'confidence_analysis': confidence_analysis,
-            'feature_importance': feature_importance.head(20).to_dict() if not feature_importance.empty else {},
-            'model_parameters': model.model_params
-        }
-        
-        # Сохраняем отчет
-        report_path = self.reports_dir / f"{symbol}_{model_type}_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(report_path, 'w') as f:
-            json.dump(full_report, f, indent=2)
-        
-        self.logger.info(
-            f"Отчет по модели сохранен: {report_path}",
-            category='ml',
-            symbol=symbol,
-            model_type=model_type
-        )
-    
-    async def generate_training_report(self, results: Dict[str, Any]):
-        """Генерирует общий отчет по обучению"""
         summary = {
             'timestamp': datetime.utcnow().isoformat(),
-            'symbols_trained': list(results.keys()),
-            'overall_performance': {}
+            'total_symbols': total_symbols,
+            'successful_models': successful_models,
+            'success_rate': success_rate,
+            'results': all_results
         }
         
-        # Собираем среднюю производительность
-        all_accuracies = []
-        all_f1_scores = []
+        # Сохраняем историю
+        self.training_history.append(summary)
         
-        for symbol, symbol_results in results.items():
-            for model_type, metrics in symbol_results.items():
-                if 'test' in metrics:
-                    all_accuracies.append(metrics['test']['accuracy'])
-                    all_f1_scores.append(metrics['test']['f1_score'])
-        
-        if all_accuracies:
-            summary['overall_performance'] = {
-                'mean_accuracy': float(np.mean(all_accuracies)),
-                'mean_f1_score': float(np.mean(all_f1_scores)),
-                'best_accuracy': float(max(all_accuracies)),
-                'worst_accuracy': float(min(all_accuracies))
-            }
-        
-        # Детальные результаты
-        summary['detailed_results'] = results
-        
-        # Сохраняем отчет
-        report_path = self.reports_dir / f"training_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(report_path, 'w') as f:
-            json.dump(summary, f, indent=2)
+        # Генерируем отчет
+        await self.generate_training_summary(summary)
         
         self.logger.info(
-            "Общий отчет по обучению сохранен",
+            f"✅ Массовое обучение завершено",
             category='ml',
-            report_path=str(report_path),
-            overall_performance=summary['overall_performance']
+            successful_models=successful_models,
+            total_symbols=total_symbols,
+            success_rate=f"{success_rate:.1%}"
         )
+        
+        return summary
+    
+    async def predict(self, symbol: str, current_data: Optional[pd.DataFrame] = None,
+                     timeframe: str = '5m', use_ensemble: bool = True) -> Dict[str, Any]:
+        """
+        Получение предсказания от обученной модели
+        """
+        try:
+            model_key = f"{symbol}_{timeframe}"
+            
+            # Попытка загрузки из памяти
+            if model_key not in self.models:
+                # Загрузка с диска
+                model_path = self.models_dir / f"{symbol}_{timeframe}_model.pkl"
+                if not model_path.exists():
+                    return {
+                        'success': False,
+                        'error': f'Модель для {symbol} не найдена. Требуется обучение.'
+                    }
+                
+                with open(model_path, 'rb') as f:
+                    model_data = pickle.load(f)
+                
+                model_to_use = model_data['ensemble'] if use_ensemble else model_data['best_single']
+                self.models[model_key] = model_to_use
+                
+                # Проверяем возраст модели
+                training_date = datetime.fromisoformat(model_data['training_date'])
+                model_age_hours = (datetime.utcnow() - training_date).total_seconds() / 3600
+                
+                if model_age_hours > self.training_config['retrain_interval_hours']:
+                    self.logger.warning(
+                        f"Модель для {symbol} устарела",
+                        category='ml',
+                        symbol=symbol,
+                        age_hours=model_age_hours
+                    )
+            
+            model = self.models[model_key]
+            
+            # Подготовка данных для предсказания
+            if current_data is None:
+                # Извлекаем свежие данные
+                features_df = await self.feature_engineer.extract_features(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    lookback_periods=100  # Меньше данных для предсказания
+                )
+                
+                if features_df.empty:
+                    return {'success': False, 'error': 'Нет данных для предсказания'}
+                
+                # Берем последнюю строку
+                X = features_df.iloc[-1:].values
+            else:
+                X = current_data.values
+            
+            # Предсказание
+            prediction = model.predict(X)[0]
+            prediction_proba = model.predict_proba(X)[0]
+            confidence = model.get_confidence(X)[0] if hasattr(model, 'get_confidence') else max(prediction_proba)
+            
+            # Интерпретация
+            direction_map = {-1: 'SELL', 0: 'HOLD', 1: 'BUY'}
+            direction = direction_map.get(prediction, 'HOLD')
+            
+            result = {
+                'success': True,
+                'symbol': symbol,
+                'direction': direction,
+                'confidence': float(confidence),
+                'prediction_value': int(prediction),
+                'probabilities': {
+                    'bearish': float(prediction_proba[0]) if len(prediction_proba) > 0 else 0.0,
+                    'neutral': float(prediction_proba[1]) if len(prediction_proba) > 1 else 0.0,
+                    'bullish': float(prediction_proba[2]) if len(prediction_proba) > 2 else 0.0
+                },
+                'model_type': 'ensemble' if use_ensemble else 'single',
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            
+            # Логируем важные предсказания
+            if confidence > 0.7:
+                self.logger.info(
+                    f"Сильный сигнал ML для {symbol}",
+                    category='ml',
+                    symbol=symbol,
+                    direction=direction,
+                    confidence=f"{confidence:.3f}"
+                )
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(
+                f"❌ Ошибка предсказания для {symbol}: {e}",
+                category='ml',
+                symbol=symbol,
+                error=str(e)
+            )
+            return {'success': False, 'error': str(e)}
+    
+    async def generate_symbol_report(self, symbol: str, timeframe: str, 
+                                   results: Dict, model_data: Dict):
+        """Генерирует отчет по обучению символа"""
+        try:
+            report = {
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'timestamp': datetime.utcnow().isoformat(),
+                'training_info': model_data['data_info'],
+                'model_performance': {
+                    name: {k: v for k, v in metrics.items() if k != 'model'}
+                    for name, metrics in results.items()
+                },
+                'best_model': max(results.keys(), key=lambda k: results[k]['val_accuracy']),
+                'ensemble_vs_best': {
+                    'ensemble_accuracy': results['ensemble']['test_accuracy'],
+                    'best_single_accuracy': max(
+                        results[k]['test_accuracy'] for k in results.keys() if k != 'ensemble'
+                    ),
+                    'improvement': results['ensemble']['test_accuracy'] - max(
+                        results[k]['test_accuracy'] for k in results.keys() if k != 'ensemble'
+                    )
+                }
+            }
+            
+            # Сохраняем отчет
+            report_path = self.reports_dir / f"{symbol}_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(report_path, 'w') as f:
+                json.dump(report, f, indent=2)
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка генерации отчета для {symbol}: {e}", category='ml')
+    
+    async def generate_training_summary(self, summary: Dict):
+        """Генерирует общий отчет по массовому обучению"""
+        try:
+            # Анализируем результаты
+            successful_results = {k: v for k, v in summary['results'].items() if v.get('success')}
+            
+            if successful_results:
+                accuracies = [r.get('ensemble_accuracy', 0) for r in successful_results.values()]
+                performance_summary = {
+                    'mean_accuracy': np.mean(accuracies),
+                    'median_accuracy': np.median(accuracies),
+                    'best_accuracy': max(accuracies),
+                    'worst_accuracy': min(accuracies),
+                    'std_accuracy': np.std(accuracies)
+                }
+            else:
+                performance_summary = {'error': 'Нет успешных результатов'}
+            
+            # Полный отчет
+            full_summary = {
+                **summary,
+                'performance_summary': performance_summary,
+                'failed_symbols': [k for k, v in summary['results'].items() if not v.get('success')],
+                'training_config': self.training_config
+            }
+            
+            # Сохраняем
+            summary_path = self.reports_dir / f"training_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(summary_path, 'w') as f:
+                json.dump(full_summary, f, indent=2)
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка генерации общего отчета: {e}", category='ml')
     
     async def auto_retrain_loop(self):
         """Автоматический цикл переобучения"""
+        self.logger.info("🔄 Запуск автоматического цикла переобучения", category='ml')
+        
         while True:
             try:
-                self.logger.info("Запуск автоматического переобучения", category='ml')
+                self.logger.info("Начинаем плановое переобучение", category='ml')
                 
                 # Обучаем все модели
-                await self.train_all_models()
+                results = await self.train_all_models()
                 
-                # Оцениваем предсказания
-                evaluation = await self.evaluate_predictions()
-                
-                self.logger.info(
-                    "Автоматическое переобучение завершено",
-                    category='ml',
-                    evaluation=evaluation
-                )
+                # Краткий анализ результатов
+                success_rate = results['success_rate']
+                if success_rate < 0.5:
+                    self.logger.warning(
+                        f"Низкий процент успешного обучения: {success_rate:.1%}",
+                        category='ml'
+                    )
                 
                 # Ждем до следующего переобучения
-                await asyncio.sleep(self.training_config['retrain_interval_hours'] * 3600)
+                interval_hours = self.training_config['retrain_interval_hours']
+                self.logger.info(
+                    f"Переобучение завершено. Следующее через {interval_hours}ч",
+                    category='ml',
+                    success_rate=f"{success_rate:.1%}"
+                )
+                
+                await asyncio.sleep(interval_hours * 3600)
                 
             except Exception as e:
                 self.logger.error(
@@ -537,4 +650,59 @@ class MLTrainer:
                     category='ml',
                     error=str(e)
                 )
-                await asyncio.sleep(3600)  # Повтор через час при ошибке
+                # При ошибке ждем час и пробуем снова
+                await asyncio.sleep(3600)
+    
+    def get_model_info(self, symbol: str, timeframe: str = '5m') -> Dict[str, Any]:
+        """Получение информации о модели"""
+        try:
+            model_path = self.models_dir / f"{symbol}_{timeframe}_model.pkl"
+            if not model_path.exists():
+                return {'exists': False}
+            
+            with open(model_path, 'rb') as f:
+                model_data = pickle.load(f)
+            
+            training_date = datetime.fromisoformat(model_data['training_date'])
+            age_hours = (datetime.utcnow() - training_date).total_seconds() / 3600
+            
+            return {
+                'exists': True,
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'training_date': model_data['training_date'],
+                'age_hours': age_hours,
+                'models_included': list(model_data['trained_models'].keys()),
+                'performance': model_data['results']['ensemble']['test_accuracy'],
+                'data_size': model_data['data_info']['train_size'],
+                'feature_count': model_data['data_info']['feature_count']
+            }
+            
+        except Exception as e:
+            return {'exists': False, 'error': str(e)}
+    
+    def list_available_models(self) -> List[Dict[str, Any]]:
+        """Список всех доступных моделей"""
+        models = []
+        for model_file in self.models_dir.glob("*.pkl"):
+            try:
+                # Парсим имя файла
+                parts = model_file.stem.split('_')
+                if len(parts) >= 3:
+                    symbol = '_'.join(parts[:-2])
+                    timeframe = parts[-2]
+                    
+                    model_info = self.get_model_info(symbol, timeframe)
+                    if model_info.get('exists'):
+                        models.append(model_info)
+            except:
+                continue
+        
+        return sorted(models, key=lambda x: x.get('age_hours', float('inf')))
+
+
+# Глобальный экземпляр тренера
+ml_trainer = MLTrainer()
+
+# Экспорт
+__all__ = ['MLTrainer', 'EnsembleModel', 'ml_trainer']
